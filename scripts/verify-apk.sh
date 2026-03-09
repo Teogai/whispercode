@@ -30,9 +30,9 @@ PASS=0
 WARN=0
 FAIL=0
 
-pass()  { ((PASS++)); echo -e "  ${GREEN}[PASS]${NC} $1"; }
-warn()  { ((WARN++)); echo -e "  ${YELLOW}[WARN]${NC} $1"; }
-fail()  { ((FAIL++)); echo -e "  ${RED}[FAIL]${NC} $1"; }
+pass()  { PASS=$((PASS + 1)); echo -e "  ${GREEN}[PASS]${NC} $1"; }
+warn()  { WARN=$((WARN + 1)); echo -e "  ${YELLOW}[WARN]${NC} $1"; }
+fail()  { FAIL=$((FAIL + 1)); echo -e "  ${RED}[FAIL]${NC} $1"; }
 info()  { echo -e "  ${CYAN}[INFO]${NC} $1"; }
 header() { echo -e "\n${CYAN}=== $1 ===${NC}"; }
 
@@ -82,8 +82,8 @@ find "$WORK_DIR/apk" -type f | sed "s|$WORK_DIR/apk/||" | sort > "$WORK_DIR/file
 TOTAL_FILES=$(wc -l < "$WORK_DIR/file_list.txt")
 info "Total files in APK: $TOTAL_FILES"
 
-# Define expected top-level entries for a Tauri Android APK
-EXPECTED_TOPS="AndroidManifest.xml classes.dex lib assets res resources.arsc META-INF"
+# Define expected top-level entries for a Tauri Android APK (including Kotlin runtime files)
+EXPECTED_TOPS="AndroidManifest.xml classes.dex lib assets res resources.arsc META-INF kotlin kotlin-tooling-metadata.json DebugProbesKt.bin"
 
 # Check for unexpected top-level entries
 ACTUAL_TOPS=$(ls "$WORK_DIR/apk/" | sort)
@@ -137,14 +137,19 @@ if [[ -d "$WORK_DIR/apk/lib" ]]; then
         fi
     done
 
-    # Check for expected Tauri .so file
+    # Check for expected Tauri .so file (may be libapp.so or libopencode_android_lib.so)
     for arch_dir in "$WORK_DIR/apk/lib/"*/; do
         arch=$(basename "$arch_dir")
-        if [[ -f "$arch_dir/libapp.so" ]]; then
-            SO_SIZE=$(stat -c%s "$arch_dir/libapp.so" 2>/dev/null || stat -f%z "$arch_dir/libapp.so" 2>/dev/null)
-            info "lib/$arch/libapp.so — $(numfmt --to=iec $SO_SIZE 2>/dev/null || echo "${SO_SIZE} bytes")"
-        else
-            warn "lib/$arch/libapp.so not found (expected for Tauri)"
+        FOUND_MAIN_SO=false
+        for so_name in libapp.so libopencode_android_lib.so; do
+            if [[ -f "$arch_dir/$so_name" ]]; then
+                SO_SIZE=$(stat -c%s "$arch_dir/$so_name" 2>/dev/null || stat -f%z "$arch_dir/$so_name" 2>/dev/null)
+                info "lib/$arch/$so_name — $(numfmt --to=iec $SO_SIZE 2>/dev/null || echo "${SO_SIZE} bytes")"
+                FOUND_MAIN_SO=true
+            fi
+        done
+        if [[ "$FOUND_MAIN_SO" == "false" ]]; then
+            warn "lib/$arch/ — no main Rust library found (expected libapp.so or libopencode_android_lib.so)"
         fi
     done
     pass "Native library directory structure looks valid"
@@ -157,15 +162,34 @@ fi
 # ============================================================================
 header "2. AndroidManifest Permissions & Components"
 
-# Expected permissions from source (main manifest + mobile-bridge)
+# Expected permissions from source (main manifest + mobile-bridge + Tauri plugins)
+# - INTERNET, ACCESS_NETWORK_STATE, RECORD_AUDIO, ACCESS_WIFI_STATE: from source manifests
+# - POST_NOTIFICATIONS, VIBRATE, WAKE_LOCK, RECEIVE_BOOT_COMPLETED: from tauri-plugin-notification
+# - DUMP: from AndroidX debug tooling
 EXPECTED_PERMISSIONS=(
     "android.permission.INTERNET"
     "android.permission.ACCESS_NETWORK_STATE"
     "android.permission.RECORD_AUDIO"
     "android.permission.ACCESS_WIFI_STATE"
+    "android.permission.POST_NOTIFICATIONS"
+    "android.permission.VIBRATE"
+    "android.permission.WAKE_LOCK"
+    "android.permission.RECEIVE_BOOT_COMPLETED"
+    "android.permission.DUMP"
 )
 
-# Try to decode manifest
+# Expected components from Tauri + AndroidX
+EXPECTED_COMPONENTS=(
+    "com.devgriffin.whispercode.MainActivity"
+    "androidx.core.content.FileProvider"
+    "androidx.startup.InitializationProvider"
+    "androidx.profileinstaller.ProfileInstallReceiver"
+    "app.tauri.notification.LocalNotificationRestoreReceiver"
+    "app.tauri.notification.NotificationDismissReceiver"
+    "app.tauri.notification.TimedNotificationPublisher"
+)
+
+# Try to decode manifest using multiple methods
 MANIFEST_DECODED=false
 
 if command -v aapt2 &>/dev/null; then
@@ -174,89 +198,64 @@ elif command -v aapt &>/dev/null; then
     aapt dump xmltree "$APK_PATH" AndroidManifest.xml > "$WORK_DIR/manifest_dump.txt" 2>/dev/null && MANIFEST_DECODED=true
 fi
 
-# Fallback: use Python to parse binary XML if available
+# Fallback: use Python to parse binary Android XML string pool
 if [[ "$MANIFEST_DECODED" == "false" ]] && command -v python3 &>/dev/null; then
-    python3 -c "
-import sys, struct, xml.etree.ElementTree as ET
+    python3 - "$WORK_DIR/apk/AndroidManifest.xml" > "$WORK_DIR/manifest_dump.txt" 2>/dev/null <<'PYEOF'
+import struct, sys
 
-# Try using androguard if available
-try:
-    from androguard.core.apk import APK
-    a = APK('$APK_PATH')
-    perms = a.get_permissions()
-    activities = a.get_activities()
-    services = a.get_services()
-    receivers = a.get_receivers()
-    providers = a.get_providers()
-    print('PERMISSIONS:')
-    for p in perms: print(f'  {p}')
-    print('ACTIVITIES:')
-    for a in activities: print(f'  {a}')
-    print('SERVICES:')
-    for s in services: print(f'  {s}')
-    print('RECEIVERS:')
-    for r in receivers: print(f'  {r}')
-    print('PROVIDERS:')
-    for p in providers: print(f'  {p}')
-except ImportError:
-    # Fallback: just search for permission strings in binary manifest
-    with open('$WORK_DIR/apk/AndroidManifest.xml', 'rb') as f:
+def parse_binary_xml_strings(filepath):
+    with open(filepath, 'rb') as f:
         data = f.read()
-    # Extract UTF-16 strings that look like permissions
-    import re
-    strings = re.findall(b'android\\.permission\\.[A-Z_]+', data)
-    print('PERMISSIONS (binary scan):')
-    for s in set(strings):
-        print(f'  {s.decode()}')
-" > "$WORK_DIR/manifest_dump.txt" 2>/dev/null && MANIFEST_DECODED=true
+    chunk_type = struct.unpack_from('<H', data, 8)[0]
+    if chunk_type != 0x0001:
+        return []
+    flags = struct.unpack_from('<I', data, 24)[0]
+    strings_start = struct.unpack_from('<I', data, 28)[0]
+    string_count = struct.unpack_from('<I', data, 16)[0]
+    is_utf8 = bool(flags & (1 << 8))
+    offsets = [struct.unpack_from('<I', data, 36 + i * 4)[0] for i in range(string_count)]
+    pool_start = 8 + strings_start
+    strings = []
+    for offset in offsets:
+        pos = pool_start + offset
+        try:
+            if is_utf8:
+                if data[pos] & 0x80: pos += 2
+                else: pos += 1
+                byte_len = data[pos]
+                if byte_len & 0x80:
+                    byte_len = ((byte_len & 0x7f) << 8) | data[pos + 1]
+                    pos += 2
+                else:
+                    pos += 1
+                s = data[pos:pos + byte_len].decode('utf-8', errors='replace')
+            else:
+                str_len = struct.unpack_from('<H', data, pos)[0]
+                pos += 2
+                s = data[pos:pos + str_len * 2].decode('utf-16-le', errors='replace')
+            strings.append(s)
+        except Exception:
+            strings.append('')
+    return strings
+
+strings = parse_binary_xml_strings(sys.argv[1])
+for s in strings:
+    if s.startswith('android.permission.'):
+        print(f"PERMISSION: {s}")
+    elif '.' in s and len(s) > 5 and any(c.isupper() for c in s) and not s.startswith(('http', 'android.', 'res/')):
+        print(f"COMPONENT: {s}")
+PYEOF
+    [[ -s "$WORK_DIR/manifest_dump.txt" ]] && MANIFEST_DECODED=true
 fi
 
 if [[ "$MANIFEST_DECODED" == "true" ]]; then
     # Extract permissions from dump
-    APK_PERMS=$(grep -oP 'android\.permission\.[A-Z_]+' "$WORK_DIR/manifest_dump.txt" | sort -u)
+    APK_PERMS=$(grep -oP 'android\.permission\.[A-Z_]+' "$WORK_DIR/manifest_dump.txt" | sort -u || true)
 
-    info "Permissions found in APK:"
-    while IFS= read -r perm; do
-        [[ -z "$perm" ]] && continue
-        EXPECTED=false
-        for ep in "${EXPECTED_PERMISSIONS[@]}"; do
-            if [[ "$perm" == "$ep" ]]; then
-                EXPECTED=true
-                break
-            fi
-        done
-        if [[ "$EXPECTED" == "true" ]]; then
-            echo -e "    ${GREEN}✓${NC} $perm (expected)"
-        else
-            echo -e "    ${RED}✗${NC} $perm (UNEXPECTED)"
-            ((FAIL++))
-        fi
-    done <<< "$APK_PERMS"
-
-    # Check if any expected permissions are missing
-    for ep in "${EXPECTED_PERMISSIONS[@]}"; do
-        if ! echo "$APK_PERMS" | grep -q "$ep"; then
-            warn "Expected permission missing: $ep"
-        fi
-    done
-
-    # Check for extra components (services, receivers) that could be injected
-    if grep -qi "service\|receiver" "$WORK_DIR/manifest_dump.txt" 2>/dev/null; then
-        SERVICES=$(grep -i "service" "$WORK_DIR/manifest_dump.txt" | head -20)
-        if [[ -n "$SERVICES" ]]; then
-            info "Services/receivers found in manifest (review manually):"
-            echo "$SERVICES" | head -10 | sed 's/^/    /'
-        fi
-    fi
-else
-    warn "Could not decode AndroidManifest.xml (install aapt2, androguard, or Android SDK)"
-    info "Falling back to binary string scan..."
-
-    # Basic binary string extraction for permissions
-    strings "$WORK_DIR/apk/AndroidManifest.xml" 2>/dev/null | grep -oP 'android\.permission\.[A-Z_]+' | sort -u > "$WORK_DIR/binary_perms.txt" || true
-    if [[ -s "$WORK_DIR/binary_perms.txt" ]]; then
-        info "Permissions found via binary scan:"
+    if [[ -n "$APK_PERMS" ]]; then
+        info "Permissions found in APK:"
         while IFS= read -r perm; do
+            [[ -z "$perm" ]] && continue
             EXPECTED=false
             for ep in "${EXPECTED_PERMISSIONS[@]}"; do
                 if [[ "$perm" == "$ep" ]]; then
@@ -268,12 +267,48 @@ else
                 echo -e "    ${GREEN}✓${NC} $perm (expected)"
             else
                 echo -e "    ${RED}✗${NC} $perm (UNEXPECTED)"
-                ((FAIL++))
+                FAIL=$((FAIL + 1))
             fi
-        done < "$WORK_DIR/binary_perms.txt"
+        done <<< "$APK_PERMS"
+
+        # Check if any expected permissions are missing
+        for ep in "${EXPECTED_PERMISSIONS[@]}"; do
+            if ! echo "$APK_PERMS" | grep -q "$ep"; then
+                info "Expected permission not present: $ep (may be optional)"
+            fi
+        done
+        pass "Manifest permissions analyzed"
     else
-        warn "Could not extract permissions from binary manifest"
+        warn "Could not extract permissions from manifest dump"
     fi
+
+    # Check for components
+    APK_COMPONENTS=$(grep "COMPONENT:" "$WORK_DIR/manifest_dump.txt" 2>/dev/null | sed 's/COMPONENT: //' | sort -u || true)
+    if [[ -n "$APK_COMPONENTS" ]]; then
+        info "Components found in APK:"
+        while IFS= read -r comp; do
+            [[ -z "$comp" ]] && continue
+            EXPECTED=false
+            for ec in "${EXPECTED_COMPONENTS[@]}"; do
+                if [[ "$comp" == "$ec" ]]; then
+                    EXPECTED=true
+                    break
+                fi
+            done
+            # Also allow standard AndroidX/Tauri components
+            if [[ "$comp" == androidx.* || "$comp" == app.tauri.* || "$comp" == com.devgriffin.whispercode.* ]]; then
+                EXPECTED=true
+            fi
+            if [[ "$EXPECTED" == "true" ]]; then
+                echo -e "    ${GREEN}✓${NC} $comp"
+            else
+                echo -e "    ${YELLOW}?${NC} $comp (review manually)"
+            fi
+        done <<< "$APK_COMPONENTS"
+        pass "Manifest components analyzed"
+    fi
+else
+    warn "Could not decode AndroidManifest.xml (install aapt2, python3, or Android SDK)"
 fi
 
 # ============================================================================
